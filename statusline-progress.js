@@ -1,11 +1,14 @@
 // Claude Code statusline: model | folder | task progress
 // Reads task tool calls (TaskCreate / TaskUpdate / TodoWrite) from the transcript.
+// Without a task list, shows what the current turn has done (time, tool calls, edited files).
 // Usage: node statusline-progress.js [--style=pips|aurora|pill|line] [--demo]
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
 const CACHE_DIR = path.join(os.homedir(), ".claude", "statusline-cache");
+const CACHE_VERSION = 2;
+const EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const arg = (name, def) => {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
   return hit ? hit.split("=")[1] : def;
@@ -70,11 +73,33 @@ function applyLine(state, line) {
     return;
   }
   const content = entry?.message?.content;
-  if (!Array.isArray(content)) return;
   const stamp = entry.timestamp ? Date.parse(entry.timestamp) : null;
+  const turn = state.turn;
+
+  // A user prompt (not a tool result) starts a new turn.
+  const isPrompt =
+    entry.type === "user" &&
+    !entry.isMeta &&
+    (typeof content === "string" || (Array.isArray(content) && content.some((b) => b.type === "text")));
+  if (isPrompt) {
+    state.turn = { start: stamp, end: null, tools: 0, files: [] };
+    return;
+  }
+  if (!Array.isArray(content)) return;
+  if (entry.type === "assistant" && turn) {
+    if (entry.message.stop_reason === "end_turn") turn.end = stamp;
+    else if (content.some((b) => b.type === "tool_use")) turn.end = null;
+  }
+
   for (const block of content) {
     if (block.type === "tool_use") {
       const input = block.input || {};
+      if (turn) {
+        turn.tools++;
+        const file = EDIT_TOOLS.includes(block.name) && (input.file_path || input.notebook_path);
+        if (file && !turn.files.includes(file)) turn.files.push(file);
+      }
+      if (/^(Task|Todo)/.test(block.name)) state.tasksAt = stamp;
       if (block.name === "TodoWrite" && Array.isArray(input.todos)) {
         state.tasks = {};
         state.order = [];
@@ -104,6 +129,14 @@ function applyLine(state, line) {
       const input = state.pending[block.tool_use_id];
       delete state.pending[block.tool_use_id];
       if (block.is_error) continue;
+      // A new task after a finished batch starts a new batch.
+      const current = state.order.map((x) => state.tasks[x]);
+      if (current.length > 0 && current.every((t) => t.status === "completed")) {
+        state.tasks = {};
+        state.order = [];
+        state.startedAt = null;
+        state.lastAt = null;
+      }
       const m = resultText(block.content).match(/#(\d+)/);
       const id = m ? m[1] : String(state.nextId);
       state.nextId = Math.max(state.nextId, Number(id) + 1);
@@ -114,15 +147,26 @@ function applyLine(state, line) {
   }
 }
 
-function readTasks(sessionId, transcriptPath) {
-  const empty = { tasks: [], startedAt: null };
-  if (!transcriptPath || !fs.existsSync(transcriptPath)) return empty;
+function readState(sessionId, transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
   fs.mkdirSync(CACHE_DIR, { recursive: true });
   const cacheFile = path.join(CACHE_DIR, `${sessionId || "default"}.json`);
   const size = fs.statSync(transcriptPath).size;
   let state = loadCache(cacheFile);
-  if (!state || state.path !== transcriptPath || state.offset > size) {
-    state = { path: transcriptPath, offset: 0, tasks: {}, order: [], pending: {}, nextId: 1, startedAt: null };
+  if (!state || state.version !== CACHE_VERSION || state.path !== transcriptPath || state.offset > size) {
+    state = {
+      version: CACHE_VERSION,
+      path: transcriptPath,
+      offset: 0,
+      tasks: {},
+      order: [],
+      pending: {},
+      nextId: 1,
+      startedAt: null,
+      lastAt: null,
+      tasksAt: null,
+      turn: null,
+    };
   }
   if (size > state.offset) {
     const fd = fs.openSync(transcriptPath, "r");
@@ -137,7 +181,13 @@ function readTasks(sessionId, transcriptPath) {
       fs.writeFileSync(cacheFile, JSON.stringify(state));
     }
   }
-  return { tasks: state.order.map((id) => state.tasks[id]).filter(Boolean), startedAt: state.startedAt, lastAt: state.lastAt };
+  return {
+    tasks: state.order.map((id) => state.tasks[id]).filter(Boolean),
+    startedAt: state.startedAt,
+    lastAt: state.lastAt,
+    tasksAt: state.tasksAt,
+    turn: state.turn,
+  };
 }
 
 // ---------- rendering ----------
@@ -227,17 +277,32 @@ function render(input, style = STYLE, now = Date.now()) {
   const dir = input.workspace?.current_dir || input.cwd;
   if (dir) parts.push(`${fg(C.dim)}${path.basename(dir)}${RESET}`);
 
-  const { tasks, startedAt, lastAt } = input._demo || readTasks(input.session_id, input.transcript_path);
-  if (tasks.length > 0) {
-    const s = summary(tasks);
+  const state = input._demo || readState(input.session_id, input.transcript_path);
+  if (!state) return parts.join(sep);
+  const { tasks, startedAt, lastAt, tasksAt, turn } = state;
+  const s = tasks.length > 0 ? summary(tasks) : null;
+  // A finished batch from an earlier turn is stale; show this turn's activity instead.
+  const stale = s && s.finished && turn && tasksAt != null && tasksAt < turn.start;
+  if (s && !stale) {
     let text = (STYLES[style] || aurora)(s, tasks);
     if (s.label) text += ` ${s.finished ? fg(C.mint) + "✓ " : fg(C.amber)}${s.label}${RESET}`;
     // Freeze the clock once every task is done.
     const took = elapsed((s.finished && lastAt ? lastAt : now) - startedAt);
     if (took) text += ` ${fg(C.dim)}${took}${RESET}`;
     parts.push(text);
+  } else if (turn && turn.tools > 0) {
+    parts.push(activity(turn, now));
   }
   return parts.join(sep);
+}
+
+// Fallback when there is no task list: what this turn has done so far.
+function activity(turn, now) {
+  const done = turn.end != null;
+  const mark = done ? fg(C.mint) + "✓" : fg(C.amber) + "◌";
+  const bits = [elapsed((done ? turn.end : now) - turn.start) || "<1m", `${turn.tools} ${turn.tools === 1 ? "tool" : "tools"}`];
+  if (turn.files.length > 0) bits.push(`${turn.files.length} ${turn.files.length === 1 ? "file" : "files"}`);
+  return `${mark}${RESET} ${fg(done ? C.dim : C.text)}${bits.join(fg(C.faint) + " · " + fg(done ? C.dim : C.text))}${RESET}`;
 }
 
 function demo() {
@@ -257,6 +322,14 @@ function demo() {
   for (const style of Object.keys(STYLES)) {
     console.log(`# ${style}`);
     for (const c of cases) console.log(render({ ...base, _demo: c }, style, now));
+  }
+  console.log("# activity (no task list)");
+  const files = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"];
+  for (const turn of [
+    { start: now - 19 * 60 * 1000, end: null, tools: 84, files },
+    { start: now - 3 * 60 * 1000, end: now - 60 * 1000, tools: 12, files: files.slice(0, 1) },
+  ]) {
+    console.log(render({ ...base, _demo: { tasks: [], turn } }, STYLE, now));
   }
 }
 

@@ -5,7 +5,7 @@
 
 Claude Code の statusline に，タスクの進捗を表示する script．
 
-Claude Code が長い作業で作るタスク一覧（TaskCreate / TaskUpdate / TodoWrite）を会話ログから読み，完了数，今のタスク，経過時間を画面の一番下に表示する．依存 package はなく，Node.js だけで動く．
+Claude Code が長い作業で作るタスク一覧（TaskCreate / TaskUpdate / TodoWrite）を会話ログから読み，完了数，今のタスク，経過時間を画面の一番下に表示する．タスク一覧が無いときは，今の依頼での経過時間，tool の呼び出し回数，編集した file の数を表示する．依存 package はなく，Node.js だけで動く．
 
 ```
 ✻ Opus 5.5 │ my-app │ ● ● ● ◉ ○ ○ 3/6 テストを修正中 23m
@@ -44,6 +44,8 @@ node ~/.claude/statusline-progress.js --demo
 **4 種類のスタイル．** `pips`，`aurora`，`pill`，`line` から `--style` で選べる．
 
 **今のタスクが分かる．** 作業中のタスク名と，全部終わったときの `✓ 完了` を表示する．
+
+**タスクが無くても何か出る．** タスク一覧が無い依頼では，`◌ 23m · 61 tools · 11 files` のように作業の量を表示する．
 
 **経過時間を表示する．** 最初のタスクを作ってからの時間を出し，全部終わった時点で止める．
 
